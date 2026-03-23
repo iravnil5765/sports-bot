@@ -38,10 +38,7 @@ CONFIDENCE = {
 ACTIVE_SPORTS = [
     'basketball_nba',
     'soccer_epl',
-    'soccer_australia_aleague',
     'icehockey_nhl',
-    'baseball_mlb',
-    'americanfootball_nfl',
 ]
 
 SPORT_DISPLAY = {
