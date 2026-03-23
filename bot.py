@@ -1,5 +1,5 @@
 """
-Sports picks Discord bot.
+Sports picks Discord bot — NZD / Betcha edition.
 Run with: python bot.py
 """
 
@@ -14,30 +14,37 @@ load_dotenv()
 
 import config
 import database
-from picks_engine import find_value_picks, to_american, determine_result
+from picks_engine import find_value_picks, to_decimal, determine_result, betcha_path
 from odds_api import get_scores
 from tracker import generate_tracker, TRACKER_PATH
+from sheets import update_sheets
+from injuries import clear_cache
 
-# ── Bot setup ─────────────────────────────────────────────────────────────────
+# ── Bot setup ──────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
+CONFIDENCE_COLORS = {
+    'ELITE':  discord.Color.from_str('#00AA44'),
+    'STRONG': discord.Color.from_str('#44BB44'),
+    'GOOD':   discord.Color.from_str('#DDAA00'),
+    'SKIP':   discord.Color.red(),
+}
 
-# ── Events ────────────────────────────────────────────────────────────────────
+
+# ── Events ─────────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
     database.init_db()
     print(f'✅ Logged in as {bot.user}')
-
     try:
         synced = await bot.tree.sync()
         print(f'   Synced {len(synced)} slash commands')
     except Exception as e:
-        print(f'   Slash command sync failed: {e}')
-
+        print(f'   Sync failed: {e}')
     if not daily_picks_task.is_running():
         daily_picks_task.start()
     if not check_results_task.is_running():
@@ -46,12 +53,12 @@ async def on_ready():
 
 # ── Slash commands ─────────────────────────────────────────────────────────────
 
-@bot.tree.command(name='picks', description="Show today's picks")
+@bot.tree.command(name='picks', description="Today's picks")
 async def cmd_picks(interaction: discord.Interaction):
     picks = database.get_today_picks()
     if not picks:
         await interaction.response.send_message(
-            "No picks posted yet today. Check back after 10 AM UTC!", ephemeral=True
+            'No picks posted yet today. Check back after 10 AM UTC!', ephemeral=True
         )
         return
     embed = _picks_list_embed(picks, "Today's Picks")
@@ -60,24 +67,29 @@ async def cmd_picks(interaction: discord.Interaction):
 
 @bot.tree.command(name='record', description='Overall record and bankroll')
 async def cmd_record(interaction: discord.Interaction):
-    rec  = database.get_record()
-    bank = database.get_bankroll()
+    rec    = database.get_record()
+    bank   = database.get_bankroll()
     profit = bank - config.STARTING_BANKROLL
     total  = rec['wins'] + rec['losses']
     wr     = (rec['wins'] / total * 100) if total else 0
+    daily_pl       = database.get_daily_pl()
+    daily_exposure = database.get_daily_exposure()
 
     embed = discord.Embed(title='📊 All-Time Record', color=discord.Color.gold())
     embed.add_field(name='Record',
-                    value=f"**{rec['wins']}W — {rec['losses']}L — {rec['voids']}P**",
-                    inline=False)
-    embed.add_field(name='Win Rate',  value=f'{wr:.1f}%',       inline=True)
-    embed.add_field(name='Pending',   value=f"{rec['pending']}", inline=True)
-    embed.add_field(name='Bankroll',  value=f'**${bank:,.2f}**', inline=True)
-    p_str = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
-    embed.add_field(name='Profit/Loss',
-                    value=f'**{p_str}** from ${config.STARTING_BANKROLL:,.0f}',
+                    value=f"**{rec['wins']}W — {rec['losses']}L — {rec['voids']}P**", inline=False)
+    embed.add_field(name='Win Rate',    value=f'{wr:.1f}%',                     inline=True)
+    embed.add_field(name='Pending',     value=str(rec['pending']),               inline=True)
+    embed.add_field(name='Bankroll',    value=f'**${bank:.2f} {config.CURRENCY}**', inline=True)
+    p_str = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
+    embed.add_field(name='All-Time P/L', value=f'**{p_str} {config.CURRENCY}**', inline=True)
+    embed.add_field(name="Today's P/L",
+                    value=f'{"+" if daily_pl >= 0 else ""}${daily_pl:.2f} {config.CURRENCY}',
                     inline=True)
-    embed.set_footer(text=f"1 unit = ${config.STARTING_BANKROLL * 0.01:.0f}")
+    embed.add_field(name="Today's Exposure",
+                    value=f'${daily_exposure:.2f} / ${config.DAILY_EXPOSURE_LIMIT:.0f} {config.CURRENCY}',
+                    inline=True)
+    embed.set_footer(text=f'1 unit = ${config.UNIT_SIZE_NZD:.0f} {config.CURRENCY} | Stop-loss: -${config.DAILY_STOP_LOSS:.0f}/day')
     await interaction.response.send_message(embed=embed)
 
 
@@ -91,7 +103,7 @@ async def cmd_history(interaction: discord.Interaction, count: int = 15):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name='pending', description='Show ungraded pending picks')
+@bot.tree.command(name='pending', description='Ungraded pending picks')
 async def cmd_pending(interaction: discord.Interaction):
     picks = database.get_pending_picks()
     if not picks:
@@ -101,34 +113,39 @@ async def cmd_pending(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name='export', description='Download Excel tracker')
+async def cmd_export(interaction: discord.Interaction):
+    await interaction.response.defer()
+    path = generate_tracker()
+    await interaction.followup.send(
+        content='📊 Picks tracker:',
+        file=discord.File(path, filename='picks_tracker.xlsx')
+    )
+
+
 @bot.tree.command(name='result', description='[ADMIN] Grade a pick')
 async def cmd_result(interaction: discord.Interaction, pick_id: int, result: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message('Admins only.', ephemeral=True)
         return
-
     result = result.upper()
     if result not in ('WIN', 'LOSS', 'VOID'):
-        await interaction.response.send_message(
-            'Result must be WIN, LOSS, or VOID.', ephemeral=True
-        )
+        await interaction.response.send_message('Result must be WIN, LOSS, or VOID.', ephemeral=True)
         return
-
     ok, new_bank = database.grade_pick(pick_id, result)
     if not ok:
         await interaction.response.send_message(
             f'Pick #{pick_id} not found or already graded.', ephemeral=True
         )
         return
-
     await interaction.response.send_message(
-        f'✅ Pick #{pick_id} → **{result}**. Bankroll: **${new_bank:,.2f}**',
+        f'✅ Pick #{pick_id} → **{result}**. Bankroll: **${new_bank:.2f} {config.CURRENCY}**',
         ephemeral=True
     )
     await _announce_result(pick_id, result)
 
 
-@bot.tree.command(name='refresh', description='[ADMIN] Post new picks right now')
+@bot.tree.command(name='refresh', description='[ADMIN] Post new picks now')
 async def cmd_refresh(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message('Admins only.', ephemeral=True)
@@ -138,27 +155,56 @@ async def cmd_refresh(interaction: discord.Interaction):
     await interaction.followup.send(f'✅ Posted {count} pick(s).', ephemeral=True)
 
 
-@bot.tree.command(name='export', description='Download the full picks tracker as an Excel file')
-async def cmd_export(interaction: discord.Interaction):
-    await interaction.response.defer()
-    path = generate_tracker()
-    await interaction.followup.send(
-        content='📊 Here\'s the full picks tracker:',
-        file=discord.File(path, filename='picks_tracker.xlsx')
-    )
+@bot.tree.command(name='limits', description='Check today\'s exposure and stop-loss status')
+async def cmd_limits(interaction: discord.Interaction):
+    exposure = database.get_daily_exposure()
+    pl       = database.get_daily_pl()
+    remaining_exposure = config.DAILY_EXPOSURE_LIMIT - exposure
+    stop_loss_remaining = config.DAILY_STOP_LOSS + pl  # how much more we can lose
+
+    color = discord.Color.green()
+    if pl <= -config.DAILY_STOP_LOSS:
+        color = discord.Color.red()
+    elif exposure >= config.DAILY_EXPOSURE_LIMIT * 0.8:
+        color = discord.Color.orange()
+
+    embed = discord.Embed(title="📊 Today's Risk Limits", color=color)
+    embed.add_field(name='Exposure Used',
+                    value=f'${exposure:.2f} / ${config.DAILY_EXPOSURE_LIMIT:.0f} {config.CURRENCY}',
+                    inline=True)
+    embed.add_field(name='Remaining Budget',
+                    value=f'${max(0, remaining_exposure):.2f} {config.CURRENCY}',
+                    inline=True)
+    embed.add_field(name="Today's P/L",
+                    value=f'{"+" if pl >= 0 else ""}${pl:.2f} {config.CURRENCY}',
+                    inline=True)
+
+    if pl <= -config.DAILY_STOP_LOSS:
+        embed.add_field(name='🚨 STOP-LOSS HIT',
+                        value=f'Down ${abs(pl):.2f} today. No more picks.',
+                        inline=False)
+    else:
+        embed.add_field(name='Stop-Loss Buffer',
+                        value=f'${stop_loss_remaining:.2f} before stop-loss',
+                        inline=True)
+
+    embed.set_footer(text='NZ Gambling Helpline: 0800 654 655')
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name='help', description='Show all commands')
 async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(title='📖 Commands', color=discord.Color.blurple())
-    embed.add_field(name='/picks',              value="Today's picks",             inline=False)
-    embed.add_field(name='/record',             value='Win/loss record + bankroll', inline=False)
-    embed.add_field(name='/history [count]',    value='Recent pick history',        inline=False)
-    embed.add_field(name='/pending',            value='Ungraded picks',             inline=False)
-    embed.add_field(name='/export',             value='Download Excel tracker',     inline=False)
-    embed.add_field(name='── Admin ──',         value='\u200b',                    inline=False)
-    embed.add_field(name='/result <id> <W/L/V>',value='Grade a pick',              inline=False)
-    embed.add_field(name='/refresh',            value='Force-fetch new picks now',  inline=False)
+    embed.add_field(name='/picks',              value="Today's picks",              inline=False)
+    embed.add_field(name='/record',             value='Record + bankroll',           inline=False)
+    embed.add_field(name='/history [count]',    value='Recent history',              inline=False)
+    embed.add_field(name='/pending',            value='Ungraded picks',              inline=False)
+    embed.add_field(name='/limits',             value="Today's exposure & stop-loss",inline=False)
+    embed.add_field(name='/export',             value='Download Excel tracker',      inline=False)
+    embed.add_field(name='── Admin ──',         value='\u200b',                     inline=False)
+    embed.add_field(name='/result <id> <W/L/V>',value='Grade a pick',               inline=False)
+    embed.add_field(name='/refresh',            value='Force-fetch picks now',       inline=False)
+    embed.set_footer(text='NZ Gambling Helpline: 0800 654 655')
     await interaction.response.send_message(embed=embed)
 
 
@@ -166,24 +212,21 @@ async def cmd_help(interaction: discord.Interaction):
 
 @tasks.loop(hours=24)
 async def daily_picks_task():
-    """Sleep until 10:00 AM UTC, then post picks."""
     now    = datetime.now(timezone.utc)
     target = now.replace(hour=10, minute=0, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
     await asyncio.sleep((target - now).total_seconds())
+    clear_cache()   # fresh injury data each day
     await post_picks()
 
 
 @tasks.loop(hours=1)
 async def check_results_task():
-    """Every hour, check if any pending picks have finished."""
     pending = database.get_pending_picks()
     if not pending:
         return
-
     now = datetime.now(timezone.utc)
-
     for pick in pending:
         try:
             ct = datetime.fromisoformat(pick['commence_time'])
@@ -191,11 +234,8 @@ async def check_results_task():
                 ct = ct.replace(tzinfo=timezone.utc)
         except Exception:
             continue
-
-        # Only check games that started at least 3 hours ago
         if now < ct + timedelta(hours=3):
             continue
-
         sport_scores = await get_scores(pick['sport'])
         for game in sport_scores:
             if game.get('id') != pick['game_id']:
@@ -205,46 +245,77 @@ async def check_results_task():
                 database.grade_pick(pick['id'], result)
                 await _announce_result(pick['id'], result)
             break
-
         await asyncio.sleep(0.2)
 
 
 # ── Core helpers ───────────────────────────────────────────────────────────────
 
 async def post_picks():
-    """Fetch value picks and post them to PICKS_CHANNEL_ID. Returns count posted."""
     ch = bot.get_channel(config.PICKS_CHANNEL_ID)
     if not ch:
         print(f'[bot] picks channel {config.PICKS_CHANNEL_ID} not found')
         return 0
 
-    picks = await find_value_picks()
-
-    unit_dollar = config.STARTING_BANKROLL * 0.01
-    today_str   = datetime.now().strftime('%A, %B %d %Y')
-
-    if not picks:
+    # Check stop-loss
+    daily_pl = database.get_daily_pl()
+    if daily_pl <= -config.DAILY_STOP_LOSS:
         await ch.send(embed=discord.Embed(
-            title='📋 No picks today',
-            description='No edge found in today\'s lines. Protecting the bankroll 💰',
+            title='🚨 Stop-Loss Hit — No Picks Today',
+            description=f'Down **${abs(daily_pl):.2f} {config.CURRENCY}** today. Protecting the bankroll.',
+            color=discord.Color.red()
+        ).set_footer(text='NZ Gambling Helpline: 0800 654 655'))
+        return 0
+
+    # Check daily exposure
+    exposure   = database.get_daily_exposure()
+    remaining  = config.DAILY_EXPOSURE_LIMIT - exposure
+    if remaining <= 0:
+        await ch.send(embed=discord.Embed(
+            title='📊 Daily Exposure Limit Reached',
+            description=f'Already staked **${exposure:.2f} {config.CURRENCY}** today (limit: ${config.DAILY_EXPOSURE_LIMIT:.0f}).',
             color=discord.Color.orange()
         ))
         return 0
 
+    picks    = await find_value_picks()
+    today_str = datetime.now().strftime('%A, %B %d %Y')
+
+    if not picks:
+        await ch.send(embed=discord.Embed(
+            title='📋 No picks today',
+            description='No value found in today\'s lines. Protecting the bankroll 💰',
+            color=discord.Color.orange()
+        ).set_footer(text='NZ Gambling Helpline: 0800 654 655'))
+        return 0
+
+    # Filter by remaining daily budget
+    filtered = []
+    budget   = remaining
+    for pick in picks:
+        if pick['stake_nzd'] <= budget:
+            filtered.append(pick)
+            budget -= pick['stake_nzd']
+
+    if not filtered:
+        return 0
+
+    total_stake = sum(p['stake_nzd'] for p in filtered)
     header = discord.Embed(
         title=f'🎯 Picks — {today_str}',
         description=(
-            f'Found **{len(picks)}** value bet(s).\n'
-            f'1 unit = **${unit_dollar:.0f}** '
-            f'(1% of ${config.STARTING_BANKROLL:,.0f} bankroll)'
+            f'**{len(filtered)}** value bet(s) found.\n'
+            f'Total exposure: **${total_stake:.2f} {config.CURRENCY}** / '
+            f'${config.DAILY_EXPOSURE_LIMIT:.0f} limit\n'
+            f'1 unit = **${config.UNIT_SIZE_NZD:.0f} {config.CURRENCY}**'
         ),
         color=discord.Color.green()
     )
-    header.set_footer(text='Picks are based on mathematical edge vs. consensus odds. Bet responsibly.')
+    header.set_footer(text='Picks are based on mathematical edge vs. consensus odds. NZ Gambling Helpline: 0800 654 655')
     await ch.send(embed=header)
 
     count = 0
-    for pick in picks:
+    for pick in filtered:
+        bpath   = betcha_path(pick)
         pick_id = database.add_pick(
             date          = datetime.now().strftime('%Y-%m-%d'),
             sport         = pick['sport'],
@@ -255,98 +326,130 @@ async def post_picks():
             bet_label     = pick['bet_label'],
             odds          = pick['odds'],
             units         = pick['units'],
+            stake_nzd     = pick['stake_nzd'],
             ev            = pick['ev'],
+            true_prob     = pick['true_prob'],
+            confidence    = pick['confidence'],
+            injury_alert  = pick.get('injury_alert', ''),
+            betcha_path   = bpath,
             game_id       = pick['game_id'],
             commence_time = pick['commence_time'].isoformat(),
         )
-        embed = _single_pick_embed(pick, pick_id)
+        embed = _single_pick_embed(pick, pick_id, bpath)
         msg   = await ch.send(embed=embed)
         database.set_message_id(pick_id, msg.id)
         count += 1
         await asyncio.sleep(0.5)
 
+    _refresh_trackers()
     return count
 
 
 async def _announce_result(pick_id, result):
-    """Post a result update to the results (or picks) channel."""
     ch_id = config.RESULTS_CHANNEL_ID or config.PICKS_CHANNEL_ID
     ch    = bot.get_channel(ch_id)
     if not ch:
         return
-
-    pick = database.get_pick(pick_id)
+    pick   = database.get_pick(pick_id)
     if not pick:
         return
-
     bank   = database.get_bankroll()
     profit = bank - config.STARTING_BANKROLL
-    unit_v = config.STARTING_BANKROLL * 0.01
+    unit_v = config.UNIT_SIZE_NZD
 
-    colors = {'WIN': discord.Color.green(), 'LOSS': discord.Color.red(),   'VOID': discord.Color.greyple()}
-    icons  = {'WIN': '✅',                  'LOSS': '❌',                   'VOID': '↩️'}
+    colors = {'WIN': discord.Color.green(), 'LOSS': discord.Color.red(), 'VOID': discord.Color.greyple()}
+    icons  = {'WIN': '✅', 'LOSS': '❌', 'VOID': '↩️'}
 
     embed = discord.Embed(
         title=f"{icons[result]} Pick #{pick_id} — {result}",
         color=colors[result]
     )
-    embed.add_field(name='Game', value=f"{pick['away_team']} @ {pick['home_team']}", inline=False)
-    embed.add_field(name='Bet',  value=f"{pick['bet_on']} ({pick['bet_label']})",   inline=True)
-    embed.add_field(name='Odds', value=to_american(pick['odds']),                    inline=True)
-    embed.add_field(name='Units', value=f"{pick['units']}u",                         inline=True)
+    embed.add_field(name='Game',  value=f"{pick['away_team']} @ {pick['home_team']}", inline=False)
+    embed.add_field(name='Bet',   value=f"{pick['bet_on']} ({pick['bet_label']})",    inline=True)
+    embed.add_field(name='Odds',  value=str(pick['odds']),                             inline=True)
+    embed.add_field(name='Units', value=f"{pick['units']}u",                           inline=True)
 
     if result == 'WIN':
         chg = pick['units'] * unit_v * (pick['odds'] - 1)
-        embed.add_field(name='Profit', value=f'+${chg:.2f}', inline=True)
+        embed.add_field(name='Profit', value=f'+${chg:.2f} {config.CURRENCY}', inline=True)
     elif result == 'LOSS':
         chg = pick['units'] * unit_v
-        embed.add_field(name='Loss',   value=f'-${chg:.2f}', inline=True)
+        embed.add_field(name='Loss',   value=f'-${chg:.2f} {config.CURRENCY}', inline=True)
 
-    embed.add_field(name='Bankroll', value=f'**${bank:,.2f}**', inline=True)
-    p_str = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
-    embed.add_field(name='All-Time P/L', value=p_str, inline=True)
+    embed.add_field(name='Bankroll',     value=f'**${bank:.2f} {config.CURRENCY}**', inline=True)
+    p_str = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
+    embed.add_field(name='All-Time P/L', value=f'{p_str} {config.CURRENCY}',          inline=True)
+    embed.set_footer(text='NZ Gambling Helpline: 0800 654 655')
     await ch.send(embed=embed)
 
-    # Silently regenerate the tracker so /export is always up to date
+    _refresh_trackers()
+
+
+def _refresh_trackers():
     try:
         generate_tracker()
     except Exception:
         pass
+    try:
+        all_picks = database.get_all_picks()
+        update_sheets(all_picks)
+    except Exception:
+        pass
 
 
-def _single_pick_embed(pick, pick_id):
+def _single_pick_embed(pick, pick_id, bpath):
     sport_name = config.SPORT_DISPLAY.get(pick['sport'], pick['sport'])
-    unit_v     = config.STARTING_BANKROLL * 0.01
+    confidence = pick['confidence']
+    conf_info  = config.CONFIDENCE.get(confidence, ('', confidence, '888888'))
+    color      = CONFIDENCE_COLORS.get(confidence, discord.Color.blue())
     ct         = pick['commence_time']
     time_str   = ct.strftime('%b %d, %I:%M %p UTC') if hasattr(ct, 'strftime') else str(ct)
 
     embed = discord.Embed(
-        title=f'Pick #{pick_id} — {sport_name}',
-        color=discord.Color.blue()
+        title=f'{conf_info[1]} — Pick #{pick_id} | {sport_name}',
+        color=color
     )
-    embed.add_field(name='Game',  value=f"**{pick['away_team']}** @ **{pick['home_team']}**", inline=False)
-    embed.add_field(name='Bet',   value=f"**{pick['bet_on']}** — {pick['bet_label']}",        inline=True)
-    embed.add_field(name='Odds',  value=f"**{to_american(pick['odds'])}** ({pick['odds']:.2f})", inline=True)
-    embed.add_field(name='Units', value=f"**{pick['units']}u** (${pick['units'] * unit_v:.0f})", inline=True)
-    embed.add_field(name='Edge',  value=f"+{pick['ev']*100:.1f}%",                            inline=True)
-    embed.add_field(name='True Prob', value=f"{pick['true_prob']*100:.1f}%",                  inline=True)
-    embed.add_field(name='Game Time', value=time_str,                                          inline=True)
-    embed.set_footer(text=f'ID #{pick_id} | result pending')
+    embed.add_field(name='Game',
+                    value=f"**{pick['away_team']}** @ **{pick['home_team']}**", inline=False)
+    embed.add_field(name='Bet',
+                    value=f"**{pick['bet_on']}** — {pick['bet_label']}",        inline=True)
+    embed.add_field(name='Decimal Odds',
+                    value=f"**{pick['odds']:.2f}**",                             inline=True)
+    embed.add_field(name='Units / Stake',
+                    value=f"**{pick['units']}u** (${pick['stake_nzd']:.2f} {config.CURRENCY})", inline=True)
+    embed.add_field(name='Est. Return',
+                    value=f"${pick['return_nzd']:.2f} {config.CURRENCY}",        inline=True)
+    embed.add_field(name='My Win Prob',
+                    value=f"{pick['true_prob']*100:.1f}%",                        inline=True)
+    embed.add_field(name='Implied Prob',
+                    value=f"{pick['implied_prob']*100:.1f}%",                     inline=True)
+    embed.add_field(name='Edge',
+                    value=f"+{pick['ev']*100:.1f}%",                              inline=True)
+    embed.add_field(name='Game Time',   value=time_str,                           inline=True)
+    embed.add_field(name='🔍 Find on Betcha', value=f'`{bpath}`',                inline=False)
+
+    if pick.get('injury_alert'):
+        embed.add_field(name='⚠️ Injury Alert', value=pick['injury_alert'],      inline=False)
+
+    embed.set_footer(text=f'ID #{pick_id} | result pending | NZ Gambling Helpline: 0800 654 655')
     return embed
 
 
 def _picks_list_embed(picks, title):
-    bank  = database.get_bankroll()
-    embed = discord.Embed(title=f'📋 {title}', color=discord.Color.blue())
-    icons = {'WIN': '✅', 'LOSS': '❌', 'VOID': '↩️', 'PENDING': '⏳'}
+    bank   = database.get_bankroll()
+    embed  = discord.Embed(title=f'📋 {title}', color=discord.Color.blue())
+    icons  = {'WIN': '✅', 'LOSS': '❌', 'VOID': '↩️', 'PENDING': '⏳'}
+    conf_icons = {'ELITE': '🟢', 'STRONG': '🟢', 'GOOD': '🟡', 'SKIP': '🔴', '': '⚪'}
 
     for p in picks:
         icon  = icons.get(p['result'], '⏳')
+        ci    = conf_icons.get(p.get('confidence', ''), '⚪')
         name  = f"{icon} #{p['id']} — {p['away_team']} @ {p['home_team']}"
-        value = f"{p['bet_on']} | {to_american(p['odds'])} | {p['units']}u | **{p['result']}**"
+        value = (f"{ci} {p['bet_on']} | **{p['odds']:.2f}** | "
+                 f"{p['units']}u (${p.get('stake_nzd', 0):.2f}) | **{p['result']}**")
         embed.add_field(name=name, value=value, inline=False)
 
-    embed.set_footer(text=f'Bankroll: ${bank:,.2f}')
+    embed.set_footer(text=f'Bankroll: ${bank:.2f} {config.CURRENCY} | NZ Gambling Helpline: 0800 654 655')
     return embed
 
 
