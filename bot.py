@@ -4,7 +4,9 @@ Run with: python bot.py
 """
 
 import asyncio
+import threading
 from datetime import datetime, timezone, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
 from discord.ext import commands, tasks
@@ -19,6 +21,24 @@ from odds_api import get_scores
 from tracker import generate_tracker, TRACKER_PATH
 from sheets import update_sheets
 from injuries import clear_cache
+
+# ── Keep-alive web server (stops Railway killing the process) ─────────────────
+
+class _Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, *args):
+        pass  # silence request logs
+
+def _start_keepalive():
+    port = int(os.getenv('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f'   Keep-alive server on port {port}')
+
+import os
 
 # ── Bot setup ──────────────────────────────────────────────────────────────────
 
@@ -450,4 +470,5 @@ def _picks_list_embed(picks, title):
 
 if __name__ == '__main__':
     database.init_db()
+    _start_keepalive()
     bot.run(config.DISCORD_TOKEN)
