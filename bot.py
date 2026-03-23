@@ -264,16 +264,33 @@ async def post_picks():
         print(f'[bot] picks channel {config.PICKS_CHANNEL_ID} not found')
         return 0
 
+    # Send scanning message
+    scan_msg = await ch.send(embed=discord.Embed(
+        title='🔍 Scanning NBA, EPL, NHL...',
+        description='Checking odds across all bookmakers for value bets.',
+        color=discord.Color.blurple()
+    ))
+
     picks     = await find_value_picks()
     today_str = datetime.now().strftime('%A, %B %d %Y')
 
     # Filter out games already posted
-    existing  = database.get_all_picks()
+    existing        = database.get_all_picks()
     posted_game_ids = {p['game_id'] for p in existing}
-    filtered  = [p for p in picks if p['game_id'] not in posted_game_ids]
+    filtered        = [p for p in picks if p['game_id'] not in posted_game_ids]
 
     if not filtered:
+        await scan_msg.edit(embed=discord.Embed(
+            title='😴 No value found this check',
+            description='No new picks right now. Next check in 2h 20m.',
+            color=discord.Color.greyple()
+        ))
         return 0
+
+    await scan_msg.edit(embed=discord.Embed(
+        title=f'✅ Found {len(filtered)} new pick(s) — posting now...',
+        color=discord.Color.green()
+    ))
 
     total_stake = sum(p['stake_nzd'] for p in filtered)
     header = discord.Embed(
