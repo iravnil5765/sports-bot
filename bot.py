@@ -212,9 +212,21 @@ async def cmd_help(interaction: discord.Interaction):
 
 @tasks.loop(minutes=140)
 async def daily_picks_task():
-    """Check for new value picks every 2h20m — uses ~240 API calls over 8 days."""
+    """Check for new value picks every 2h20m starting at 10:40 AM UTC (10:40 PM NZT)."""
     clear_cache()
     await post_picks()
+
+@daily_picks_task.before_loop
+async def before_daily_picks():
+    """Wait until 10:40 AM UTC before starting the loop."""
+    await bot.wait_until_ready()
+    now    = datetime.now(timezone.utc)
+    target = now.replace(hour=10, minute=40, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    wait_seconds = (target - now).total_seconds()
+    print(f'⏳ First pick check in {wait_seconds/3600:.1f} hours (10:40 AM UTC)')
+    await asyncio.sleep(wait_seconds)
 
 
 @tasks.loop(hours=1)
