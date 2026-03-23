@@ -210,14 +210,10 @@ async def cmd_help(interaction: discord.Interaction):
 
 # ── Scheduled tasks ────────────────────────────────────────────────────────────
 
-@tasks.loop(hours=24)
+@tasks.loop(hours=2)
 async def daily_picks_task():
-    now    = datetime.now(timezone.utc)
-    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    await asyncio.sleep((target - now).total_seconds())
-    clear_cache()   # fresh injury data each day
+    """Check for new value picks every 2 hours."""
+    clear_cache()
     await post_picks()
 
 
@@ -258,14 +254,13 @@ async def post_picks():
 
     picks     = await find_value_picks()
     today_str = datetime.now().strftime('%A, %B %d %Y')
-    filtered  = picks
 
-    if not picks:
-        await ch.send(embed=discord.Embed(
-            title='📋 No picks today',
-            description='No value found in today\'s lines. Check back tomorrow.',
-            color=discord.Color.orange()
-        ))
+    # Filter out games already posted
+    existing  = database.get_all_picks()
+    posted_game_ids = {p['game_id'] for p in existing}
+    filtered  = [p for p in picks if p['game_id'] not in posted_game_ids]
+
+    if not filtered:
         return 0
 
     total_stake = sum(p['stake_nzd'] for p in filtered)
