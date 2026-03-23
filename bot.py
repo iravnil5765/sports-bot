@@ -210,9 +210,9 @@ async def cmd_help(interaction: discord.Interaction):
 
 # ── Scheduled tasks ────────────────────────────────────────────────────────────
 
-@tasks.loop(hours=2)
+@tasks.loop(minutes=140)
 async def daily_picks_task():
-    """Check for new value picks every 2 hours."""
+    """Check for new value picks every 2h20m — uses ~240 API calls over 8 days."""
     clear_cache()
     await post_picks()
 
