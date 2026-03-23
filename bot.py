@@ -256,47 +256,16 @@ async def post_picks():
         print(f'[bot] picks channel {config.PICKS_CHANNEL_ID} not found')
         return 0
 
-    # Check stop-loss
-    daily_pl = database.get_daily_pl()
-    if daily_pl <= -config.DAILY_STOP_LOSS:
-        await ch.send(embed=discord.Embed(
-            title='🚨 Stop-Loss Hit — No Picks Today',
-            description=f'Down **${abs(daily_pl):.2f} {config.CURRENCY}** today. Protecting the bankroll.',
-            color=discord.Color.red()
-        ).set_footer(text='NZ Gambling Helpline: 0800 654 655'))
-        return 0
-
-    # Check daily exposure
-    exposure   = database.get_daily_exposure()
-    remaining  = config.DAILY_EXPOSURE_LIMIT - exposure
-    if remaining <= 0:
-        await ch.send(embed=discord.Embed(
-            title='📊 Daily Exposure Limit Reached',
-            description=f'Already staked **${exposure:.2f} {config.CURRENCY}** today (limit: ${config.DAILY_EXPOSURE_LIMIT:.0f}).',
-            color=discord.Color.orange()
-        ))
-        return 0
-
-    picks    = await find_value_picks()
+    picks     = await find_value_picks()
     today_str = datetime.now().strftime('%A, %B %d %Y')
+    filtered  = picks
 
     if not picks:
         await ch.send(embed=discord.Embed(
             title='📋 No picks today',
-            description='No value found in today\'s lines. Protecting the bankroll 💰',
+            description='No value found in today\'s lines. Check back tomorrow.',
             color=discord.Color.orange()
-        ).set_footer(text='NZ Gambling Helpline: 0800 654 655'))
-        return 0
-
-    # Filter by remaining daily budget
-    filtered = []
-    budget   = remaining
-    for pick in picks:
-        if pick['stake_nzd'] <= budget:
-            filtered.append(pick)
-            budget -= pick['stake_nzd']
-
-    if not filtered:
+        ))
         return 0
 
     total_stake = sum(p['stake_nzd'] for p in filtered)

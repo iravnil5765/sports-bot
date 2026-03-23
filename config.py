@@ -15,15 +15,15 @@ CURRENCY_SYMBOL  = '$'
 STARTING_BANKROLL = float(os.getenv('STARTING_BANKROLL', 100))
 UNIT_SIZE_NZD    = 5.0          # 1 unit = $5 NZD
 
-# ── Risk management ────────────────────────────────────────────────────────────
-DAILY_EXPOSURE_LIMIT = 40.0     # Max $40 NZD staked in one day
-DAILY_STOP_LOSS      = 25.0     # Stop picking if down $25 NZD in one day
-MAX_UNITS_PER_BET    = 2        # Never more than 2u on a single bet
-MIN_WIN_PROBABILITY  = 0.55     # Never recommend below 55% true probability
+# ── Risk management (disabled — paper trading mode) ───────────────────────────
+DAILY_EXPOSURE_LIMIT = 999999.0
+DAILY_STOP_LOSS      = 999999.0
+MAX_UNITS_PER_BET    = 3
+MIN_WIN_PROBABILITY  = 0.52     # Very low filter — more picks
 
 # ── Pick settings ──────────────────────────────────────────────────────────────
-MAX_DAILY_PICKS   = 6
-MIN_EV_THRESHOLD  = 0.02        # Minimum 2% edge
+MAX_DAILY_PICKS   = 10
+MIN_EV_THRESHOLD  = 0.01        # 1% edge minimum — casts a wide net
 
 # ── Confidence tiers ───────────────────────────────────────────────────────────
 # Based on true win probability
